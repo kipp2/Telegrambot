@@ -1,0 +1,13 @@
+.env
+.env.*
+*.session
+*.session.json
+__pycache__/
+*.pyc
+.vscode/
+*.swp
+.DS_Store
+instance/
+secrets/
+*.sqlite3
+*.log
