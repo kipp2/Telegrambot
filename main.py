@@ -19,6 +19,7 @@ BUTTON_TEXT = os.getenv("BUTTON_TEXT", "🎁 Hourly Bonus")
 CHECK_INTERVAL_MIN = int(os.getenv("CHECK_INTERVAL_MIN", 60))
 JITTER_SECONDS = int(os.getenv("JITTER_SECONDS", 300))
 LOG_RECEIVER_ID = int(os.getenv("LOG_RECEIVER_ID", 0))
+COOLDOWN_SECONDS = 3600
 
 if not os.path.exists("logs"):
     os.makedirs("logs")
@@ -39,12 +40,32 @@ def extract_reward_value(text):
         return float(match.group(1))
     return 0.0
 
+def extract_time_remaining(text):
+    m = re.search(r"(\d+)\s*(?:minutes|min|m)", text.lower())
+    if m:
+        return int(m.group(1)) * 60
+    m = re.search(r"(\d+):(\d+):(\d+)", text)
+    if m:
+        h, m1, s = map(int, m.groups())
+        return h * 3600 + m1 * 60 + s
+    return None
+
 def record_claim(value):
     if not os.path.exists("data"):
         os.makedirs("data")
     with open("data/claims.csv", "a", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([datetime.now(timezone.utc).isoformat(), value])
+
+def get_last_claim_time():
+    if not os.path.exists("data/claims.csv"):
+        return None
+    with open("data/claims.csv") as f:
+        lines = f.readlines()
+        if not lines:
+            return None
+        last_time = lines[-1].split(",")[0]
+        return datetime.fromisoformat(last_time)
 
 def get_weekly_total():
     if not os.path.exists("data/claims.csv"):
@@ -67,6 +88,15 @@ async def send_log(client, message):
             logger.warning(f"Failed to send Telegram log: {e}")
 
 async def claim_bonus_cycle(client, bot_username, trigger_text, target_button_text):
+    last_claim_time = get_last_claim_time()
+    if last_claim_time:
+        since = (datetime.now(timezone.utc) - last_claim_time).total_seconds()
+        if since < COOLDOWN_SECONDS:
+            msg = f"⚠️ Claim skipped: last claim was {int(since // 60)} min ago."
+            logger.warning(msg)
+            await send_log(client, msg)
+            return False
+
     logger.info(f"Sending trigger '{trigger_text}' to @{bot_username}...")
     try:
         await client.send_message(bot_username, trigger_text)
@@ -92,7 +122,14 @@ async def claim_bonus_cycle(client, bot_username, trigger_text, target_button_te
                                 logger.info(msg_text)
                                 await send_log(client, msg_text)
                                 return True
+                            time_remain = extract_time_remaining(reply.text)
+                            if time_remain:
+                                msg = f"⏳ Bot reports cooldown: try again in {int(time_remain // 60)} minutes."
+                                logger.warning(msg)
+                                await send_log(client, msg)
+                                return False
         logger.warning("No claim button found after sending trigger.")
+        await send_log(client, "⚠️ No claim button found — possible cooldown.")
         return False
     except Exception as e:
         logger.error(f"Error while trying to claim bonus: {e}")
@@ -110,10 +147,6 @@ async def main():
                 trigger_text=TRIGGER_TEXT,
                 target_button_text=BUTTON_TEXT
             )
-            if success:
-                logger.info("Bonus claimed successfully this round.")
-            else:
-                logger.warning("Bonus claim failed this round.")
             base_sleep = CHECK_INTERVAL_MIN * 60
             jitter = random.randint(0, JITTER_SECONDS)
             total_sleep = base_sleep + jitter
