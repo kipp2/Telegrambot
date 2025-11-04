@@ -19,7 +19,6 @@ BUTTON_TEXT = os.getenv("BUTTON_TEXT", "🎁 Hourly Bonus")
 CHECK_INTERVAL_MIN = int(os.getenv("CHECK_INTERVAL_MIN", 60))
 JITTER_SECONDS = int(os.getenv("JITTER_SECONDS", 300))
 LOG_RECEIVER_ID = int(os.getenv("LOG_RECEIVER_ID", 0))
-COOLDOWN_SECONDS = 3600
 
 if not os.path.exists("logs"):
     os.makedirs("logs")
@@ -40,41 +39,12 @@ def extract_reward_value(text):
         return float(match.group(1))
     return 0.0
 
-def extract_time_remaining(text):
-    t = text.lower()
-    # Handle formats like "after 38 minutes 25 sec"
-    m = re.search(r"after\s*(\d+)\s*minutes?\s*(\d+)?\s*(?:sec|seconds)?", t)
-    if m:
-        minutes = int(m.group(1))
-        seconds = int(m.group(2)) if m.group(2) else 0
-        return minutes * 60 + seconds
-    # Handle "xx minutes"
-    m = re.search(r"(\d+)\s*(?:minutes|min|m)", t)
-    if m:
-        return int(m.group(1)) * 60
-    # Handle "hh:mm:ss"
-    m = re.search(r"(\d+):(\d+):(\d+)", t)
-    if m:
-        h, m1, s = map(int, m.groups())
-        return h * 3600 + m1 * 60 + s
-    return None
-
 def record_claim(value):
     if not os.path.exists("data"):
         os.makedirs("data")
     with open("data/claims.csv", "a", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([datetime.now(timezone.utc).isoformat(), value])
-
-def get_last_claim_time():
-    if not os.path.exists("data/claims.csv"):
-        return None
-    with open("data/claims.csv") as f:
-        lines = f.readlines()
-        if not lines:
-            return None
-        last_time = lines[-1].split(",")[0]
-        return datetime.fromisoformat(last_time)
 
 def get_weekly_total():
     if not os.path.exists("data/claims.csv"):
@@ -96,59 +66,188 @@ async def send_log(client, message):
         except Exception as e:
             logger.warning(f"Failed to send Telegram log: {e}")
 
+import csv
+import re
+from datetime import timedelta
+
+DATA_DIR = "data"
+os.makedirs(DATA_DIR, exist_ok=True)
+COOLDOWN_SECONDS = 3600  # 1 hour
+
+def get_last_claim_time():
+    path = os.path.join(DATA_DIR, "claims.csv")
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return None
+    try:
+        with open(path, "r") as f:
+            rows = list(csv.reader(f))
+        if not rows:
+            return None
+        last_time = datetime.fromisoformat(rows[-1][0])
+        return last_time.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def record_claim(amount):
+    path = os.path.join(DATA_DIR, "claims.csv")
+    with open(path, "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([datetime.now(timezone.utc).isoformat(), amount])
+
+
+def get_weekly_total():
+    path = os.path.join(DATA_DIR, "claims.csv")
+    if not os.path.exists(path):
+        return 0.0
+    total = 0.0
+    week_ago = datetime.now(timezone.utc) - timedelta(days=7)
+    with open(path, "r") as f:
+        reader = csv.reader(f)
+        for row in reader:
+            try:
+                timestamp = datetime.fromisoformat(row[0])
+                if timestamp >= week_ago:
+                    total += float(row[1])
+            except Exception:
+                continue
+    return total
+
+
+def extract_reward_value(text):
+    match = re.search(r"([\d.]+)\s*(LTC|DOGE|BTC|USDT|TRX)", text, re.I)
+    if match:
+        return float(match.group(1))
+    return 0.0
+
+
+def extract_time_remaining(text):
+    match = re.search(r"after\s+(\d+)\s*minutes?\s*(\d+)?", text, re.I)
+    if match:
+        minutes = int(match.group(1))
+        seconds = int(match.group(2) or 0)
+        return minutes * 60 + seconds
+    return None
+
+
+async def send_log(client, message):
+    log_chat_id = os.getenv("LOG_CHAT_ID")
+    if not log_chat_id:
+        logger.info(f"LOG: {message}")
+        return
+    try:
+        await client.send_message(int(log_chat_id), message)
+    except Exception as e:
+        logger.warning(f"Failed to send log message: {e}")
+
+
 async def claim_bonus_cycle(client, bot_username, trigger_text, target_button_text):
+    # --- Local cooldown check ---
     last_claim_time = get_last_claim_time()
     if last_claim_time:
         since = (datetime.now(timezone.utc) - last_claim_time).total_seconds()
         if since < COOLDOWN_SECONDS:
-            msg = f"⚠️ Claim skipped: last claim was {int(since // 60)} min ago."
+            remain_local = int(COOLDOWN_SECONDS - since)
+            msg = f"⚠️ Local cooldown active: next claim in {remain_local//60}m {remain_local%60}s."
             logger.warning(msg)
             await send_log(client, msg)
-            return False
+            return False, remain_local
 
     logger.info(f"Sending trigger '{trigger_text}' to @{bot_username}...")
     try:
-        await client.send_message(bot_username, trigger_text)
-        await asyncio.sleep(5)
-        messages = await client.get_messages(bot_username, limit=5)
-        for msg in messages:
-            # Detect cooldown messages first
-            time_remain = extract_time_remaining(msg.text)
-            if "🚫" in msg.text or time_remain:
-                remain_min = int((time_remain or 0) / 60)
-                msg_text = f"⏳ Claim failed: cooldown {remain_min} minutes remaining."
-                logger.warning(msg_text)
-                await send_log(client, msg_text)
-                return False
+        sent = await client.send_message(bot_username, trigger_text)
+        send_time = sent.date.replace(tzinfo=timezone.utc)
 
-            # Then detect successful reward messages
-            if "received" in msg.text.lower() or "bonus" in msg.text.lower():
-                value = extract_reward_value(msg.text)
-                if value > 0:
-                    record_claim(value)
-                    claim_num = sum(1 for _ in open("data/claims.csv"))
-                    weekly_total = get_weekly_total()
-                    msg_text = f"✅ Claim #{claim_num}: +{value} LTC\n📅 Weekly total: {weekly_total:.8f} LTC"
-                    logger.info(msg_text)
+        # --- Wait for new bot messages after trigger ---
+        WAIT_TIMEOUT = 20
+        POLL_INTERVAL = 1
+        elapsed = 0
+        claim_clicked = False
+
+        while elapsed < WAIT_TIMEOUT:
+            await asyncio.sleep(POLL_INTERVAL)
+            elapsed += POLL_INTERVAL
+            messages = await client.get_messages(bot_username, limit=8)
+            new_msgs = [
+                m for m in messages
+                if getattr(m, "date", send_time).replace(tzinfo=timezone.utc) >= send_time
+            ]
+            if not new_msgs:
+                continue
+
+            for msg in new_msgs:
+                text = msg.text or ""
+                cooldown_time = extract_time_remaining(text)
+
+                # --- Step 1: Click button first ---
+                if msg.buttons and not claim_clicked:
+                    for row in msg.buttons:
+                        for button in row:
+                            if target_button_text.lower() in (button.text or "").lower():
+                                logger.info(f"Found '{button.text}', clicking...")
+                                await button.click()
+                                claim_clicked = True
+                                await asyncio.sleep(5)
+
+                                # after click, fetch fresh messages
+                                post_msgs = await client.get_messages(bot_username, limit=6)
+                                for pm in post_msgs:
+                                    ptext = pm.text or ""
+                                    if "🚫" in ptext or "after" in ptext.lower():
+                                        remain_remote = int(extract_time_remaining(ptext) or 0)
+                                        msg_text = f"⏳ Remote cooldown active: {remain_remote//60}m {remain_remote%60}s."
+                                        logger.warning(msg_text)
+                                        await send_log(client, msg_text)
+                                        return False, remain_remote
+                                    if "received" in ptext.lower() or "bonus" in ptext.lower():
+                                        value = extract_reward_value(ptext)
+                                        if value > 0:
+                                            record_claim(value)
+                                            claim_num = sum(1 for _ in open("data/claims.csv"))
+                                            total = get_weekly_total()
+                                            text_done = (
+                                                f"✅ Claim #{claim_num}: +{value} LTC\n"
+                                                f"📅 Weekly total: {total:.8f} LTC"
+                                            )
+                                            logger.info(text_done)
+                                            await send_log(client, text_done)
+                                            return True, COOLDOWN_SECONDS
+                                # If click didn't trigger any new valid message, continue
+                                continue
+
+                # --- Step 2: Fallback checks if no button ---
+                if "🚫" in text or cooldown_time:
+                    remain_remote = int((cooldown_time or 0))
+                    msg_text = f"⏳ Remote cooldown detected: {remain_remote//60}m {remain_remote%60}s."
+                    logger.warning(msg_text)
                     await send_log(client, msg_text)
-                    return True
+                    return False, remain_remote or COOLDOWN_SECONDS
 
-            if msg.buttons:
-                for row in msg.buttons:
-                    for button in row:
-                        if target_button_text.lower() in button.text.lower():
-                            logger.info(f"Found button '{button.text}', clicking...")
-                            await button.click()
-                            await asyncio.sleep(4)
-                            return await claim_bonus_cycle(client, bot_username, trigger_text, target_button_text)
+                if "received" in text.lower() or "bonus" in text.lower():
+                    value = extract_reward_value(text)
+                    if value > 0:
+                        record_claim(value)
+                        claim_num = sum(1 for _ in open("data/claims.csv"))
+                        total = get_weekly_total()
+                        text_done = (
+                            f"✅ Claim #{claim_num}: +{value} LTC\n"
+                            f"📅 Weekly total: {total:.8f} LTC"
+                        )
+                        logger.info(text_done)
+                        await send_log(client, text_done)
+                        return True, COOLDOWN_SECONDS
 
-        logger.warning("No claim button or reward found — possible cooldown.")
-        await send_log(client, "⚠️ No claim button or reward found.")
-        return False
+        # --- Timeout fallback ---
+        msg = "⚠️ No response or button found after waiting."
+        logger.warning(msg)
+        await send_log(client, msg)
+        return False, COOLDOWN_SECONDS
+
     except Exception as e:
-        logger.error(f"Error while trying to claim bonus: {e}")
-        await send_log(client, f"❌ Error during claim: {e}")
-        return False
+        logger.error(f"❌ Error while claiming: {e}")
+        await send_log(client, f"❌ Error: {e}")
+        return False, COOLDOWN_SECONDS
+
 
 async def main():
     async with TelegramClient(SESSION, API_ID, API_HASH) as client:
@@ -161,6 +260,10 @@ async def main():
                 trigger_text=TRIGGER_TEXT,
                 target_button_text=BUTTON_TEXT
             )
+            if success:
+                logger.info("Bonus claimed successfully this round.")
+            else:
+                logger.warning("Bonus claim failed this round.")
             base_sleep = CHECK_INTERVAL_MIN * 60
             jitter = random.randint(0, JITTER_SECONDS)
             total_sleep = base_sleep + jitter
