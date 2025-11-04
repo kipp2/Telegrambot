@@ -41,10 +41,19 @@ def extract_reward_value(text):
     return 0.0
 
 def extract_time_remaining(text):
-    m = re.search(r"(\d+)\s*(?:minutes|min|m)", text.lower())
+    t = text.lower()
+    # Handle formats like "after 38 minutes 25 sec"
+    m = re.search(r"after\s*(\d+)\s*minutes?\s*(\d+)?\s*(?:sec|seconds)?", t)
+    if m:
+        minutes = int(m.group(1))
+        seconds = int(m.group(2)) if m.group(2) else 0
+        return minutes * 60 + seconds
+    # Handle "xx minutes"
+    m = re.search(r"(\d+)\s*(?:minutes|min|m)", t)
     if m:
         return int(m.group(1)) * 60
-    m = re.search(r"(\d+):(\d+):(\d+)", text)
+    # Handle "hh:mm:ss"
+    m = re.search(r"(\d+):(\d+):(\d+)", t)
     if m:
         h, m1, s = map(int, m.groups())
         return h * 3600 + m1 * 60 + s
@@ -103,33 +112,38 @@ async def claim_bonus_cycle(client, bot_username, trigger_text, target_button_te
         await asyncio.sleep(5)
         messages = await client.get_messages(bot_username, limit=5)
         for msg in messages:
-            if not msg.buttons:
-                continue
-            for row in msg.buttons:
-                for button in row:
-                    if target_button_text.lower() in button.text.lower():
-                        logger.info(f"Found button '{button.text}', clicking...")
-                        await button.click()
-                        await asyncio.sleep(4)
-                        new_msgs = await client.get_messages(bot_username, limit=3)
-                        for reply in new_msgs:
-                            if "received" in reply.text.lower() or "bonus" in reply.text.lower():
-                                value = extract_reward_value(reply.text)
-                                record_claim(value)
-                                claim_num = sum(1 for _ in open("data/claims.csv"))
-                                weekly_total = get_weekly_total()
-                                msg_text = f"✅ Claim #{claim_num}: +{value} LTC\n📅 Weekly total: {weekly_total:.8f} LTC"
-                                logger.info(msg_text)
-                                await send_log(client, msg_text)
-                                return True
-                            time_remain = extract_time_remaining(reply.text)
-                            if time_remain:
-                                msg = f"⏳ Bot reports cooldown: try again in {int(time_remain // 60)} minutes."
-                                logger.warning(msg)
-                                await send_log(client, msg)
-                                return False
-        logger.warning("No claim button found after sending trigger.")
-        await send_log(client, "⚠️ No claim button found — possible cooldown.")
+            # Detect cooldown messages first
+            time_remain = extract_time_remaining(msg.text)
+            if "🚫" in msg.text or time_remain:
+                remain_min = int((time_remain or 0) / 60)
+                msg_text = f"⏳ Claim failed: cooldown {remain_min} minutes remaining."
+                logger.warning(msg_text)
+                await send_log(client, msg_text)
+                return False
+
+            # Then detect successful reward messages
+            if "received" in msg.text.lower() or "bonus" in msg.text.lower():
+                value = extract_reward_value(msg.text)
+                if value > 0:
+                    record_claim(value)
+                    claim_num = sum(1 for _ in open("data/claims.csv"))
+                    weekly_total = get_weekly_total()
+                    msg_text = f"✅ Claim #{claim_num}: +{value} LTC\n📅 Weekly total: {weekly_total:.8f} LTC"
+                    logger.info(msg_text)
+                    await send_log(client, msg_text)
+                    return True
+
+            if msg.buttons:
+                for row in msg.buttons:
+                    for button in row:
+                        if target_button_text.lower() in button.text.lower():
+                            logger.info(f"Found button '{button.text}', clicking...")
+                            await button.click()
+                            await asyncio.sleep(4)
+                            return await claim_bonus_cycle(client, bot_username, trigger_text, target_button_text)
+
+        logger.warning("No claim button or reward found — possible cooldown.")
+        await send_log(client, "⚠️ No claim button or reward found.")
         return False
     except Exception as e:
         logger.error(f"Error while trying to claim bonus: {e}")
